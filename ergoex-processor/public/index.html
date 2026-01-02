@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>ErgoEx Control Center</title>
+  <link rel="stylesheet" href="/app.css"/>
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <div class="brand">
+        <span style="font-size:18px;">ErgoEx</span>
+        <span class="badge">Control Center</span>
+      </div>
+      <div class="row" style="gap:10px;">
+        <button class="btn" id="refreshBtn">Refresh</button>
+        <a class="btn" href="http://localhost:3000/d/adkmrkt/ergoex?orgId=1" target="_blank">Open Grafana</a>
+      </div>
+    </div>
+
+    <div class="grid kpis" id="kpis">
+      <div class="kpi"><div class="label">Active Workers</div><div class="value" id="kpiActive">-</div><div class="sub">Online (trunk+knee)</div></div>
+      <div class="kpi"><div class="label">Caution</div><div class="value" id="kpiCaution">-</div><div class="sub">Workers needing attention</div></div>
+      <div class="kpi"><div class="label">High Risk</div><div class="value" id="kpiHigh">-</div><div class="sub">Immediate intervention</div></div>
+      <div class="kpi"><div class="label">Events (1h)</div><div class="value" id="kpiEvents">-</div><div class="sub">Detected in last hour</div></div>
+    </div>
+
+    <div class="grid main">
+      <div class="card">
+        <h3>Active Workers</h3>
+        <div class="workers">
+          <div class="worker-grid" id="workerGrid"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Live Event Feed</h3>
+        <div class="events" id="eventFeed"></div>
+      </div>
+    </div>
+
+    <div class="small" style="margin-top:14px;">
+      Tip: click a worker card to open details. Graphs are rendered via Grafana; counts and statuses come from Node API.
+    </div>
+  </div>
+
+<script>
+const API = ""; // same origin (Node HTTP)
+const $ = (id)=>document.getElementById(id);
+
+function pillClass(risk){
+  if(risk==="high") return "bad";
+  if(risk==="caution") return "warn";
+  return "good";
+}
+
+async function load(){
+  // Workers
+  const wRes = await fetch(API + "/workers");
+  const wJson = await wRes.json();
+  const workers = wJson.data || [];
+
+  let active=0, caution=0, high=0;
+  const grid = $("workerGrid");
+  grid.innerHTML = "";
+
+  for(const w of workers){
+    if(w.suit_state==="online") active++;
+    if(w.worker_risk==="caution") caution++;
+    if(w.worker_risk==="high") high++;
+
+    const pill = pillClass(w.worker_risk);
+    const el = document.createElement("div");
+    el.className = "worker";
+    el.onclick = ()=>location.href = "/worker.html?worker_id=" + encodeURIComponent(w.worker_id);
+    el.innerHTML = `
+      <div class="row">
+        <div class="wid">${w.worker_id}</div>
+        <div class="pill ${pill}">${w.worker_risk.toUpperCase()}</div>
+      </div>
+      <div class="meta">
+        <div class="mrow"><span>Suit</span><span>${w.suit_state}</span></div>
+        <div class="mrow"><span>Trunk</span><span>${w.trunk_online ? "online" : "offline"}</span></div>
+        <div class="mrow"><span>Knee</span><span>${w.knee_online ? "online" : "offline"}</span></div>
+      </div>
+    `;
+    grid.appendChild(el);
+  }
+
+  $("kpiActive").textContent = active;
+  $("kpiCaution").textContent = caution;
+  $("kpiHigh").textContent = high;
+
+  // Events (last hour)
+  const eRes = await fetch(API + "/events?hours=1&limit=50");
+  const eJson = await eRes.json();
+  const events = eJson.data || [];
+  $("kpiEvents").textContent = events.length;
+
+  const feed = $("eventFeed");
+  feed.innerHTML = "";
+  for(const ev of events){
+    const el = document.createElement("div");
+    el.className = "event";
+    const when = new Date(ev.timestamp).toLocaleTimeString();
+    el.innerHTML = `
+      <div class="t"><span>${ev.workerId}</span><span>${when}</span></div>
+      <div class="b">
+        <div class="type">${ev.type}</div>
+        <div class="pill ${pillClass(ev.severity==="high"?"high":(ev.severity==="medium"?"caution":"ok"))}">${String(ev.severity).toUpperCase()}</div>
+      </div>
+      <div class="small">${JSON.stringify(ev.metrics || {})}</div>
+    `;
+    feed.appendChild(el);
+  }
+}
+
+$("refreshBtn").onclick = load;
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: ergoex-mqtt
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: ergoex-db
+    environment:
+      POSTGRES_DB: ergoex_db
+      POSTGRES_USER: ergoex
+      POSTGRES_PASSWORD: ergoex_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ergoex_db_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ergoex-grafana
+    depends_on:
+      - timescaledb
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+    volumes:
+      - ergoex_grafana_data:/var/lib/grafana
+
+volumes:
+  ergoex_db_data:
+  ergoex_grafana_data:

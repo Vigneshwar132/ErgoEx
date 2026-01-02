@@ -1,0 +1,340 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>ErgoEx Worker</title>
+  <link rel="stylesheet" href="/app.css"/>
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <div class="row" style="gap:10px;">
+        <button class="btn" onclick="history.back()">← Back</button>
+        <span class="badge">Worker</span>
+      </div>
+      <div class="row" style="gap:10px;">
+        <span class="small" id="conn">WS: connecting…</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between; align-items:flex-start;">
+        <div>
+          <div style="font-size:22px;font-weight:800;" id="wid">worker_---</div>
+          <div class="small" id="subline">Suit: -</div>
+        </div>
+        <div class="pill good" id="riskPill">OK</div>
+      </div>
+    </div>
+
+    <div class="grid kpis" style="margin-top:14px;">
+      <div class="kpi">
+        <div class="label">Heart Rate (bpm)</div>
+        <div class="value" id="kpiHr">-</div>
+        <div class="sub">Merged from trunk+knee</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Load Index</div>
+        <div class="value" id="kpiLoad">-</div>
+        <div class="sub">Fatigue / RULA / REBA</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Temperature (°C)</div>
+        <div class="value" id="kpiTemp">-</div>
+        <div class="sub">From latest telemetry</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Micro-breaks (today)</div>
+        <div class="value" id="kpiBreaks">-</div>
+        <div class="sub">Taken / Recommended</div>
+      </div>
+    </div>
+
+    <div class="grid main" style="margin-top:14px;">
+      <div class="card">
+        <h3>Heart Rate Trend (Realtime)</h3>
+        <canvas id="hrCanvas" width="900" height="260" style="width:100%;height:260px;"></canvas>
+        <div class="small">Updates every second. No Grafana iframe.</div>
+      </div>
+
+      <div class="card">
+        <h3>Posture Timeline (Realtime)</h3>
+        <canvas id="poseCanvas" width="900" height="260" style="width:100%;height:260px;"></canvas>
+        <div class="small">Trunk pitch + Knee pitch (degrees)</div>
+      </div>
+    </div>
+
+    <div class="grid kpis" style="margin-top:14px;">
+      <div class="kpi">
+        <div class="label">Lift Events (8h)</div>
+        <div class="value" id="kpiLift">-</div>
+        <div class="sub">Threshold-crossing</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Bend Events (8h)</div>
+        <div class="value" id="kpiBend">-</div>
+        <div class="sub">Threshold-crossing</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Twist Events (8h)</div>
+        <div class="value" id="kpiTwist">-</div>
+        <div class="sub">Gyro Z threshold</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Strategy Model</div>
+        <div class="value" id="kpiStrat">Live</div>
+        <div class="sub">Back / Squat / Mixed</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <h3>How it’s calculated (current logic)</h3>
+      <div class="small" style="line-height:1.7">
+        <b>Bend</b>: trunk |pitch| crosses above <code>bend_start_deg</code> and resets below <code>bend_reset_deg</code>, with <code>event_cooldown_ms</code>.<br/>
+        <b>Lift</b>: knee |pitch| crosses above <code>lift_start_deg</code> and resets below <code>lift_reset_deg</code>, with cooldown.<br/>
+        <b>Twist</b>: trunk |wz| crosses above <code>twist_start_dps</code> and resets below <code>twist_reset_dps</code>, with cooldown.<br/>
+        <b>Load Index</b>: uses strategy classification (back/squat/mixed) + trunk exposure zone (neutral/moderate/high) → accumulates fatigue increment per second and scales to a 0–300-ish number.
+        <br/><br/>
+        Your “linked segments + strategy classification + exposure + RULA/REBA” text is aligned with this server.js (we classify strategy from trunk+knee, compute exposure zone, compute RULA/REBA proxies).
+      </div>
+    </div>
+  </div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+
+const params = new URLSearchParams(location.search);
+const WORKER_ID = params.get("worker_id") || "worker_001";
+
+$("wid").textContent = WORKER_ID;
+
+function pillClass(risk){
+  if(risk==="high") return "bad";
+  if(risk==="caution") return "warn";
+  return "good";
+}
+
+// ---------- Ring buffers (last 5 minutes at 1Hz ~ 300 points) ----------
+const MAX_POINTS = 300;
+const hrSeries = [];     // {ts,bpm}
+const trunkSeries = [];  // {ts,val}
+const kneeSeries = [];   // {ts,val}
+
+function pushSeries(arr, point){
+  arr.push(point);
+  while(arr.length > MAX_POINTS) arr.shift();
+}
+
+function niceNum(x){ return (x==null || Number.isNaN(x)) ? "-" : String(x); }
+
+// ---------- Drawing (simple, clean Apple-ish) ----------
+function drawGrid(ctx, w, h){
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0,0,w,h);
+
+  // subtle grid
+  ctx.strokeStyle = "rgba(0,0,0,0.06)";
+  ctx.lineWidth = 1;
+  for(let i=0;i<=5;i++){
+    const y = 20 + i*(h-40)/5;
+    ctx.beginPath(); ctx.moveTo(50,y); ctx.lineTo(w-10,y); ctx.stroke();
+  }
+  for(let i=0;i<=6;i++){
+    const x = 50 + i*(w-70)/6;
+    ctx.beginPath(); ctx.moveTo(x,20); ctx.lineTo(x,h-20); ctx.stroke();
+  }
+}
+
+function drawLine(ctx, w, h, data, getY, color){
+  if(data.length < 2) return;
+  const left=50, top=20, right=w-10, bottom=h-20;
+  const xs = data.map(d=>d.ts);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const spanX = Math.max(1, maxX-minX);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for(let i=0;i<data.length;i++){
+    const d = data[i];
+    if(d == null) continue;
+    const x = left + ((d.ts - minX)/spanX) * (right-left);
+    const yv = getY(d);
+    if(yv == null || Number.isNaN(yv)) continue;
+
+    const y = top + (1 - yv) * (bottom-top);
+    if(i===0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+}
+
+function drawAxes(ctx, w, h, yMin, yMax, label){
+  const left=50, top=20, right=w-10, bottom=h-20;
+
+  ctx.strokeStyle = "rgba(0,0,0,0.12)";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(left,top); ctx.lineTo(left,bottom); ctx.lineTo(right,bottom); ctx.stroke();
+
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto";
+  ctx.fillText(label, 52, 14);
+
+  // y labels
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  for(let i=0;i<=5;i++){
+    const y = top + i*(bottom-top)/5;
+    const val = (yMax - i*(yMax-yMin)/5).toFixed(0);
+    ctx.fillText(val, 8, y+4);
+  }
+}
+
+function norm(val, min, max){
+  if(val == null) return null;
+  if(max===min) return 0.5;
+  return Math.max(0, Math.min(1, (val-min)/(max-min)));
+}
+
+function renderHR(){
+  const c = $("hrCanvas");
+  const ctx = c.getContext("2d");
+  const w=c.width, h=c.height;
+
+  drawGrid(ctx,w,h);
+
+  // choose scale
+  const vals = hrSeries.map(p=>p.bpm).filter(v=>v!=null);
+  const yMin = Math.min(...vals, 50);
+  const yMax = Math.max(...vals, 140);
+
+  drawAxes(ctx,w,h,yMin,yMax,"bpm");
+
+  drawLine(ctx,w,h,hrSeries, (d)=>norm(d.bpm, yMin, yMax), "#18a957"); // green
+}
+
+function renderPose(){
+  const c = $("poseCanvas");
+  const ctx = c.getContext("2d");
+  const w=c.width, h=c.height;
+
+  drawGrid(ctx,w,h);
+
+  // posture scale -90..90
+  const yMin = -90, yMax = 90;
+  drawAxes(ctx,w,h,yMin,yMax,"degrees");
+
+  drawLine(ctx,w,h,trunkSeries, (d)=>norm(d.val, yMin, yMax), "#f28c28"); // orange
+  drawLine(ctx,w,h,kneeSeries,  (d)=>norm(d.val, yMin, yMax), "#d93025"); // red
+
+  // legend
+  ctx.fillStyle="rgba(0,0,0,0.65)";
+  ctx.font="12px system-ui, -apple-system, Segoe UI";
+  ctx.fillText("Trunk", 70, h-8);
+  ctx.fillStyle="#f28c28"; ctx.fillRect(52, h-16, 12, 4);
+  ctx.fillStyle="rgba(0,0,0,0.65)";
+  ctx.fillText("Knee", 140, h-8);
+  ctx.fillStyle="#d93025"; ctx.fillRect(122, h-16, 12, 4);
+}
+
+setInterval(()=>{ renderHR(); renderPose(); }, 1000);
+
+// ---------- Initial load ----------
+async function loadInitialSeries(){
+  try{
+    const r = await fetch(`/worker/live?worker_id=${encodeURIComponent(WORKER_ID)}&secs=300`);
+    const j = await r.json();
+    const arr = j.data || [];
+    for(const p of arr){
+      if(p.ts==null) continue;
+      if(p.bpm!=null) pushSeries(hrSeries, {ts:p.ts, bpm:p.bpm});
+      if(p.trunk_pitch!=null) pushSeries(trunkSeries, {ts:p.ts, val:p.trunk_pitch});
+      if(p.knee_pitch!=null) pushSeries(kneeSeries, {ts:p.ts, val:p.knee_pitch});
+    }
+  }catch(e){}
+}
+
+// ---------- Cards refresh (slow, not every second) ----------
+async function refreshCards(){
+  try{
+    const r = await fetch(`/worker/detail?worker_id=${encodeURIComponent(WORKER_ID)}`);
+    const d = await r.json();
+
+    $("subline").textContent = `Suit: ${d.suit_state} • Risk: ${String(d.worker_risk||"ok").toUpperCase()}`;
+    $("riskPill").className = "pill " + pillClass(d.worker_risk);
+    $("riskPill").textContent = String(d.worker_risk||"ok").toUpperCase();
+
+    $("kpiHr").textContent = niceNum(d.heart_rate);
+    $("kpiTemp").textContent = d.temperature!=null ? d.temperature.toFixed(1) : "-";
+    $("kpiLoad").textContent = d.load_index!=null ? d.load_index.toFixed(1) : "-";
+    $("kpiBreaks").textContent = `${d.micro_breaks_taken || 0}/${d.micro_breaks_recommended || 0}`;
+  }catch(e){}
+}
+
+async function refreshShift(){
+  try{
+    const r = await fetch(`/worker/shift-summary?worker_id=${encodeURIComponent(WORKER_ID)}&hours=8`);
+    const d = await r.json();
+    $("kpiLift").textContent = d.lift ?? 0;
+    $("kpiBend").textContent = d.bend ?? 0;
+    $("kpiTwist").textContent = d.twist ?? 0;
+  }catch(e){}
+}
+
+// ---------- WebSocket realtime stream ----------
+function startWS(){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const wsUrl = `${proto}://${location.hostname}:8080`;
+  const ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    $("conn").textContent = "WS: connected";
+    ws.send(JSON.stringify({type:"subscribe", worker_id: WORKER_ID}));
+  };
+
+  ws.onclose = () => $("conn").textContent = "WS: disconnected";
+  ws.onerror = () => $("conn").textContent = "WS: error";
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try{ msg = JSON.parse(ev.data); }catch(e){ return; }
+    if(msg.type !== "telemetry") return;
+    const t = msg.data || {};
+    if(t.worker_id !== WORKER_ID) return;
+
+    const ts = t.ts || Date.now();
+
+    // store series
+    if(t.bpm != null) pushSeries(hrSeries, {ts, bpm: t.bpm});
+    if(t.role === "trunk" && t.pitch != null) pushSeries(trunkSeries, {ts, val: t.pitch});
+    if(t.role === "knee"  && t.pitch != null) pushSeries(kneeSeries,  {ts, val: t.pitch});
+
+    // optional: quick strategy indicator
+    const lastT = trunkSeries.length ? trunkSeries[trunkSeries.length-1].val : null;
+    const lastK = kneeSeries.length  ? kneeSeries[kneeSeries.length-1].val  : null;
+    if(lastT!=null && lastK!=null){
+      const at = Math.abs(lastT), ak = Math.abs(lastK);
+      let strat = "neutral";
+      if(at > 45 && ak < 20) strat = "back";
+      else if(at < 30 && ak > 40) strat = "squat";
+      else if(at > 30 && ak > 30) strat = "mixed";
+      $("kpiStrat").textContent = strat.toUpperCase();
+    }
+  };
+}
+
+(async function init(){
+  await loadInitialSeries();
+  renderHR(); renderPose();
+  startWS();
+  refreshCards();
+  refreshShift();
+
+  // slow refresh so cards update but charts don’t “reload”
+  setInterval(refreshCards, 15000);
+  setInterval(refreshShift, 15000);
+})();
+</script>
+</body>
+</html>
